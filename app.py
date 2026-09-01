@@ -238,9 +238,19 @@ active_members = members_df[members_df["active"]] if not members_df.empty else m
 name_by_id = dict(zip(members_df["id"], members_df["name"])) if not members_df.empty else {}
 
 # Live quotes for every symbol on the board
-symbols = tuple(sorted({str(s).strip().upper() for s in recos_df.get("symbol", [])
-                        if isinstance(s, str) and s.strip()})) if not recos_df.empty else ()
-quotes = prices.fetch_quotes(symbols) if symbols else {}
+# (ticker, company name) pairs — the name is the last-resort way to resolve a
+# BSE-only or oddly-coded scrip whose ticker was typed wrong.
+if recos_df.empty:
+    holdings = ()
+else:
+    seen, pairs = set(), []
+    for _, _r in recos_df.iterrows():
+        _sym = str(_r.get("symbol") or "").strip().upper()
+        if _sym and _sym not in seen:
+            seen.add(_sym)
+            pairs.append((_sym, str(_r.get("stock") or "")))
+    holdings = tuple(pairs)
+quotes = prices.fetch_quotes(holdings) if holdings else {}
 
 stats, present_map = attendance_stats(members_df, meetings_df, att_df) \
     if not members_df.empty else ({}, {})
@@ -333,7 +343,9 @@ with tab_r:
                 "Call": r["action"],
                 "Reco price": num(r["reco_price"]),
                 "CMP": c,
-                "Source": {"live": "live", "manual": "manual", "none": "—"}[src],
+                "Source": (quotes.get(str(r["symbol"] or "").strip().upper(), {})
+                           .get("symbol") or "live") if src == "live"
+                          else ("entered" if src == "manual" else "—"),
                 "Return %": ret,
                 "Days": held,
                 "Status": "Closed" if r["status"] == "closed" else "Live",
@@ -372,10 +384,14 @@ with tab_r:
         if missing:
             ui.alert("warn", f"No live price for {len(missing)} call(s)",
                      ui.esc(", ".join(missing)) +
-                     ". The ticker may be wrong or delisted — <strong>ZOMATO</strong> is now "
-                     "<strong>ETERNAL</strong>, and <strong>TATAMOTORS</strong> no longer "
-                     "resolves after the demerger. Fix the ticker, or set a fallback "
-                     "price when editing the call.")
+                     ".<br>Things to try, in order: use the <strong>bare NSE code</strong> "
+                     "(RELIANCE, not RELIANCE.NS) &middot; for a <strong>BSE-only</strong> scrip "
+                     "use its 6-digit BSE code (e.g. 543931) or add <strong>.BO</strong> "
+                     "(TATAINVEST.BO) &middot; some names have changed: <strong>ZOMATO</strong> is "
+                     "now <strong>ETERNAL</strong>, and <strong>TATAMOTORS</strong> no longer "
+                     "resolves after the demerger. If nothing works, set a "
+                     "<strong>Fallback price</strong> when editing the call and the return "
+                     "will still be calculated.")
 
     st.divider()
     if gate("add or change recommendations") and not members_df.empty:

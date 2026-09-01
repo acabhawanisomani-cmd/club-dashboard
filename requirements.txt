@@ -16,3 +16,5 @@ psycopg2-binary>=2.9.9
 # NOTE: touch this file whenever database.py/prices.py gain new functions.
 # Streamlit Cloud otherwise serves a cached module and calls to the new helper
 # fail with AttributeError until the environment is rebuilt.
+
+# Rebuild marker: prices.resolve_symbol() + NSE SME (-SM) support
