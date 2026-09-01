@@ -1,0 +1,18 @@
+# Pinned scientific stack — a mutually compatible, pre-numpy-2 set that is
+# rock-solid on Python 3.12. Leaving these unpinned lets a fresh rebuild pull
+# numpy 2.x + latest pandas, whose binaries segfault (signal 11) inside pandas.
+# Do not loosen without testing.
+streamlit>=1.30.0
+numpy==1.26.4
+pandas==2.2.3
+
+# NO yfinance. It pulls native C-extensions (curl_cffi, frozendict) that
+# segfault on Streamlit Cloud under Yahoo rate-limiting. Prices come from
+# plain `requests` against Yahoo's public chart JSON — see prices.py.
+requests>=2.32.0
+
+psycopg2-binary>=2.9.9
+
+# NOTE: touch this file whenever database.py/prices.py gain new functions.
+# Streamlit Cloud otherwise serves a cached module and calls to the new helper
+# fail with AttributeError until the environment is rebuilt.

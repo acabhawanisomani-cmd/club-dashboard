@@ -1,0 +1,13 @@
+# Streamlit's own theme sets the base colours; ui.py restyles everything else.
+[theme]
+base = "dark"
+primaryColor = "#63BDDD"
+backgroundColor = "#0C1317"
+secondaryBackgroundColor = "#121C22"
+textColor = "#E7EEF2"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

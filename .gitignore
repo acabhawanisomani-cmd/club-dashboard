@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+club_data.db
+.streamlit/secrets.toml
