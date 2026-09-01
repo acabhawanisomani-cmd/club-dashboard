@@ -98,6 +98,11 @@ _PG_SCHEMA = [
         exit_date DATE,
         created_at TIMESTAMPTZ DEFAULT NOW()
     )""",
+    """CREATE TABLE IF NOT EXISTS reco_members (
+        reco_id INTEGER NOT NULL REFERENCES recos(id) ON DELETE CASCADE,
+        member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        PRIMARY KEY (reco_id, member_id)
+    )""",
     """CREATE TABLE IF NOT EXISTS meetings (
         id SERIAL PRIMARY KEY,
         meet_date DATE NOT NULL,
@@ -140,6 +145,14 @@ def init_schema():
         cur = conn.cursor()
         for stmt in (_PG_SCHEMA if _USE_PG else _SQLITE_SCHEMA):
             cur.execute(stmt)
+        # Backfill: every recommendation created before multi-recommender
+        # support had exactly one author in recos.member_id. Copy those across
+        # once so nothing loses its attribution. Safe to re-run.
+        cur.execute("""INSERT INTO reco_members (reco_id, member_id)
+                       SELECT r.id, r.member_id FROM recos r
+                       WHERE r.member_id IS NOT NULL
+                         AND NOT EXISTS (SELECT 1 FROM reco_members rm
+                                         WHERE rm.reco_id = r.id)""")
         conn.commit()
         conn.close()
         INIT_ERROR = None
@@ -222,26 +235,55 @@ def list_recos() -> pd.DataFrame:
     """)
 
 
-def add_reco(reco_date, member_id, stock, symbol, action, reco_price,
+def list_reco_members() -> pd.DataFrame:
+    """Every (reco_id, member_id) pair — a recommendation may have several authors."""
+    return _read("SELECT reco_id, member_id FROM reco_members")
+
+
+def set_reco_members(reco_id, member_ids) -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(_q("DELETE FROM reco_members WHERE reco_id=?"), (reco_id,))
+        for mid in member_ids:
+            if mid is None:
+                continue
+            cur.execute(_q("INSERT INTO reco_members (reco_id, member_id) VALUES (?, ?)"),
+                        (reco_id, int(mid)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def add_reco(reco_date, member_ids, stock, symbol, action, reco_price,
              target_price, notes, manual_price=None) -> int:
-    return _write_returning_id(
+    """`member_ids` may be a single id or a list — a call can have co-authors.
+    The first is also kept in recos.member_id so older queries still work."""
+    ids = [member_ids] if isinstance(member_ids, (int, float, str)) else list(member_ids or [])
+    primary = int(ids[0]) if ids else None
+    rid = _write_returning_id(
         """INSERT INTO recos (reco_date, member_id, stock, symbol, action,
            reco_price, target_price, notes, manual_price, status)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
-        (reco_date, member_id, stock, symbol, action, reco_price,
+        (reco_date, primary, stock, symbol, action, reco_price,
          target_price, notes, manual_price),
     )
+    set_reco_members(rid, ids)
+    return rid
 
 
-def update_reco(rid, reco_date, member_id, stock, symbol, action, reco_price,
+def update_reco(rid, member_ids, reco_date, stock, symbol, action, reco_price,
                 target_price, notes, status, exit_price, exit_date,
                 manual_price=None) -> None:
+    ids = [member_ids] if isinstance(member_ids, (int, float, str)) else list(member_ids or [])
+    primary = int(ids[0]) if ids else None
     _write("""UPDATE recos SET reco_date=?, member_id=?, stock=?, symbol=?,
               action=?, reco_price=?, target_price=?, notes=?, status=?,
               exit_price=?, exit_date=?, manual_price=? WHERE id=?""",
-           (reco_date, member_id, stock, symbol, action, reco_price,
+           (reco_date, primary, stock, symbol, action, reco_price,
             target_price, notes, status, exit_price, exit_date,
             manual_price, rid))
+    set_reco_members(rid, ids)
 
 
 def set_manual_price(rid, price) -> None:
@@ -332,7 +374,7 @@ def is_empty() -> bool:
 
 
 def wipe_all() -> None:
-    for t in ("attendance", "recos", "ledger", "meetings", "members"):
+    for t in ("attendance", "reco_members", "recos", "ledger", "meetings", "members"):
         _write(f"DELETE FROM {t}")
 
 
@@ -354,7 +396,7 @@ def load_demo() -> None:
         ("Infosys", "INFY", "Buy", 1290.00, 2, 30),
         ("ITC", "ITC", "Sell", 292.00, 3, 22),
     ]:
-        add_reco(today - timedelta(days=ago), ids[who], stock, sym, act,
+        add_reco(today - timedelta(days=ago), [ids[who]], stock, sym, act,
                  price, None, "Demo entry — replace with your own.")
 
     for ago, place, present in [

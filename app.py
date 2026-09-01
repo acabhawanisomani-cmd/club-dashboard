@@ -113,7 +113,7 @@ def sidebar():
             st.success("Editing unlocked")
             if st.button("Lock editing", use_container_width=True):
                 st.session_state.unlocked = False
-                st.rerun()
+                rerun_fresh()
         else:
             st.caption("You can read everything. Editing needs the club passcode.")
             with st.form("unlock", clear_on_submit=True):
@@ -121,7 +121,7 @@ def sidebar():
                 if st.form_submit_button("Unlock editing", use_container_width=True):
                     if entered == PASSCODE:
                         st.session_state.unlocked = True
-                        st.rerun()
+                        rerun_fresh()
                     else:
                         st.error("That passcode is not right.")
 
@@ -140,7 +140,7 @@ def sidebar():
                     if confirm.strip().upper() == "ERASE":
                         db.wipe_all()
                         st.success("All data cleared.")
-                        st.rerun()
+                        rerun_fresh()
                     else:
                         st.error("Type ERASE in the box first.")
 
@@ -226,13 +226,56 @@ if db.INIT_ERROR:
     )
     st.stop()
 
+# Every Streamlit interaction re-runs this whole script. Uncached, that meant
+# eight fresh TLS connections to Neon per click, which is what made the app
+# feel slow. One cached call now covers a page render; writes clear it, and the
+# short TTL keeps other members' changes appearing quickly.
+DATA_TTL = 30  # seconds
+
+
+@st.cache_data(ttl=DATA_TTL, show_spinner=False)
+def _load_all():
+    return (db.list_members(), db.list_recos(), db.list_meetings(),
+            db.list_attendance(), db.list_ledger(), db.list_reco_members(),
+            db.is_empty())
+
+
+def refresh_data():
+    """Drop the cached snapshot so the next render reads the database."""
+    _load_all.clear()
+
+
+def rerun_fresh():
+    refresh_data()
+    st.rerun()
+
+
 sidebar()
 
-members_df = db.list_members()
-recos_df = db.list_recos()
-meetings_df = db.list_meetings()
-att_df = db.list_attendance()
-ledger_df = db.list_ledger()
+(members_df, recos_df, meetings_df, att_df, ledger_df,
+ recomem_df, data_is_empty) = _load_all()
+
+# reco id -> [member ids]; a call may have several authors
+authors_by_reco = {}
+if not recomem_df.empty:
+    for _rid, _grp in recomem_df.groupby("reco_id"):
+        authors_by_reco[_rid] = list(_grp["member_id"])
+
+
+def authors_of(reco_row):
+    """Member ids credited with a call, falling back to the legacy single column."""
+    ids = authors_by_reco.get(reco_row["id"])
+    if ids:
+        return ids
+    single = reco_row.get("member_id")
+    return [single] if single is not None and not pd.isna(single) else []
+
+
+def author_names(reco_row):
+    ids = authors_of(reco_row)
+    if not ids:
+        return "Former member"
+    return ", ".join(name_by_id.get(i, "Former member") for i in ids)
 
 active_members = members_df[members_df["active"]] if not members_df.empty else members_df
 name_by_id = dict(zip(members_df["id"], members_df["name"])) if not members_df.empty else {}
@@ -298,13 +341,13 @@ if len(flagged):
              + "".join(f'<span class="chip absent">{ui.esc(m["name"])}</span>' for m in flagged)
              + "</div><p>")
 
-if db.is_empty() and can_edit():
+if data_is_empty and can_edit():
     with st.container(border=True):
         st.markdown("**Want to see it filled in first?** Load a small demo club — "
                     "four members, four calls, four meetings and a starter ledger.")
         if st.button("Load demo data"):
             db.load_demo()
-            st.rerun()
+            rerun_fresh()
 
 tab_r, tab_a, tab_f, tab_m = st.tabs(
     ["📈 Recommendations", "🗓️ Attendance", "💰 Fund & Expenses", "👥 Members"])
@@ -317,13 +360,21 @@ with tab_r:
     left, right = st.columns([4, 1])
     if right.button("↻ Refresh prices", use_container_width=True):
         prices.fetch_quote.clear()   # per-ticker cache; fetch_quotes is uncached
-        st.rerun()
+        rerun_fresh()
 
     if members_df.empty:
         st.info("Add your members first — every call is credited to someone on the roster.")
     elif recos_df.empty:
         st.info("No recommendations logged yet.")
     else:
+        f1, f2, f3, f4 = st.columns([1.3, 1.3, 1.2, 1.2])
+        who_filter = f1.selectbox(
+            "Member", ["Everyone"] + list(members_df["name"]), key="rf_member")
+        call_filter = f2.selectbox("Call", ["All"] + CALLS, key="rf_call")
+        sort_by = f3.selectbox(
+            "Sort by", ["Date", "Member", "Stock", "Call", "Return"], key="rf_sort")
+        sort_dir = f4.selectbox("Order", ["Newest · highest · Z–A",
+                                          "Oldest · lowest · A–Z"], key="rf_dir")
         show_closed = left.checkbox("Include closed positions", value=False)
         rows, missing = [], []
         for _, r in recos_df.iterrows():
@@ -337,7 +388,8 @@ with tab_r:
                 if as_date(r["reco_date"]) else None
             rows.append({
                 "Date": as_date(r["reco_date"]),
-                "Recommended by": r["member_name"] or "Former member",
+                "Recommended by": author_names(r),
+                "_author_ids": authors_of(r),
                 "Stock": r["stock"],
                 "Ticker": r["symbol"] or "",
                 "Call": r["action"],
@@ -350,6 +402,38 @@ with tab_r:
                 "Days": held,
                 "Status": "Closed" if r["status"] == "closed" else "Live",
             })
+
+        # filter
+        if who_filter != "Everyone":
+            _wid = next((int(m["id"]) for _, m in members_df.iterrows()
+                         if m["name"] == who_filter), None)
+            rows = [r for r in rows if _wid in r["_author_ids"]]
+        if call_filter != "All":
+            rows = [r for r in rows if r["Call"] == call_filter]
+
+        # sort — None returns sort last either way, never above real numbers
+        _desc = sort_dir.startswith("Newest")
+        _keys = {
+            "Date":   lambda r: (r["Date"] is None, r["Date"] or date.min),
+            "Member": lambda r: r["Recommended by"].lower(),
+            "Stock":  lambda r: str(r["Stock"]).lower(),
+            "Call":   lambda r: str(r["Call"]),
+            "Return": lambda r: (r["Return %"] is None,
+                                 r["Return %"] if r["Return %"] is not None else 0.0),
+        }
+        rows.sort(key=_keys[sort_by], reverse=_desc)
+        # Rows with no date / no price belong at the bottom whichever way the
+        # sort runs — a blank is not "the highest value".
+        if sort_by in ("Date", "Return"):
+            _field = "Date" if sort_by == "Date" else "Return %"
+            rows = ([r for r in rows if r[_field] is not None] +
+                    [r for r in rows if r[_field] is None])
+        # recompute the summary from what is actually on screen
+        returns = [r["Return %"] for r in rows if r["Return %"] is not None]
+
+        if not rows:
+            ui.alert("info", "Nothing matches those filters",
+                     "Try setting Member back to Everyone, or Call back to All.")
 
         trs = []
         for r in rows:
@@ -399,8 +483,11 @@ with tab_r:
             with st.form("add_reco", clear_on_submit=True):
                 c1, c2, c3 = st.columns(3)
                 d = c1.date_input("Date", value=date.today(), format="DD/MM/YYYY")
-                who = c2.selectbox("Recommended by", active_members["id"],
-                                   format_func=lambda i: name_by_id.get(i, "?"))
+                who = c2.multiselect(
+                    "Recommended by", list(active_members["id"]),
+                    default=list(active_members["id"])[:1],
+                    format_func=lambda i: name_by_id.get(i, "?"),
+                    help="Pick more than one if several members backed the same call.")
                 call = c3.selectbox("Call", CALLS)
                 c4, c5, c6 = st.columns(3)
                 stock = c4.text_input("Stock name", placeholder="Tata Motors")
@@ -417,19 +504,21 @@ with tab_r:
                 if st.form_submit_button("Add recommendation", type="primary"):
                     if not stock.strip():
                         st.error("Enter the stock name.")
+                    elif not who:
+                        st.error("Pick at least one member who recommended it.")
                     elif rp <= 0:
                         st.error("Enter the recommended price.")
                     else:
-                        db.add_reco(d, int(who), stock.strip(),
+                        db.add_reco(d, [int(x) for x in who], stock.strip(),
                                     sym.strip().upper(), call, rp,
                                     tgt or None, notes.strip(), fallback or None)
                         st.success(f"Added {stock.strip()}.")
-                        st.rerun()
+                        rerun_fresh()
 
         if not recos_df.empty:
             with st.expander("✏️ Edit or delete a recommendation"):
                 labels = {int(r["id"]): f'{fmt_date(r["reco_date"])} · {r["stock"]} '
-                                        f'({r["action"]}) · {r["member_name"] or "—"}'
+                                        f'({r["action"]}) · {author_names(r)}'
                           for _, r in recos_df.iterrows()}
                 rid = st.selectbox("Pick a recommendation", list(labels),
                                    format_func=lambda i: labels[i], key="edit_reco_pick")
@@ -439,9 +528,11 @@ with tab_r:
                     d = c1.date_input("Date", value=as_date(cur["reco_date"]) or date.today(),
                                       format="DD/MM/YYYY")
                     mem_ids = list(members_df["id"])
-                    who = c2.selectbox(
-                        "Recommended by", mem_ids,
-                        index=mem_ids.index(cur["member_id"]) if cur["member_id"] in mem_ids else 0,
+                    _cur_authors = [i for i in authors_by_reco.get(rid, [])
+                                    if i in mem_ids] or (
+                        [cur["member_id"]] if cur["member_id"] in mem_ids else [])
+                    who = c2.multiselect(
+                        "Recommended by", mem_ids, default=_cur_authors,
                         format_func=lambda i: name_by_id.get(i, "?"))
                     call = c3.selectbox("Call", CALLS, index=CALLS.index(cur["action"])
                                         if cur["action"] in CALLS else 0)
@@ -469,18 +560,21 @@ with tab_r:
 
                     s1, s2 = st.columns([3, 1])
                     if s1.form_submit_button("Save changes", type="primary"):
-                        db.update_reco(int(rid), d, int(who), stock.strip(),
+                        if not who:
+                            st.error("Pick at least one member who recommended it.")
+                            st.stop()
+                        db.update_reco(int(rid), [int(x) for x in who], d, stock.strip(),
                                        sym.strip().upper(), call, rp, tgt or None,
                                        notes.strip(), status,
                                        ex_p or None,
                                        ex_d if status == "closed" else None,
                                        fallback or None)
                         st.success("Saved.")
-                        st.rerun()
+                        rerun_fresh()
                     if s2.form_submit_button("Delete"):
                         db.delete_reco(int(rid))
                         st.success("Deleted.")
-                        st.rerun()
+                        rerun_fresh()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -560,7 +654,7 @@ with tab_a:
                     else:
                         db.add_meeting(d, place.strip(), agenda.strip(), present)
                         st.success("Meeting logged.")
-                        st.rerun()
+                        rerun_fresh()
 
         if not meetings_df.empty:
             with st.expander("✏️ Edit or delete a meeting"):
@@ -585,11 +679,11 @@ with tab_a:
                     if s1.form_submit_button("Save changes", type="primary"):
                         db.update_meeting(int(mid), d, place.strip(), agenda.strip(), present)
                         st.success("Saved.")
-                        st.rerun()
+                        rerun_fresh()
                     if s2.form_submit_button("Delete"):
                         db.delete_meeting(int(mid))
                         st.success("Deleted.")
-                        st.rerun()
+                        rerun_fresh()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -680,7 +774,7 @@ with tab_f:
                         else:
                             db.add_entry(d, "credit", amt, cat, int(who), mode, desc.strip())
                             st.success("Contribution recorded.")
-                            st.rerun()
+                            rerun_fresh()
         with add_d:
             with st.expander("➖ Record an expense (debit)"):
                 with st.form("add_debit", clear_on_submit=True):
@@ -703,7 +797,7 @@ with tab_f:
                             db.add_entry(d, "debit", amt, cat,
                                          int(who) if who else None, mode, desc.strip())
                             st.success("Expense recorded.")
-                            st.rerun()
+                            rerun_fresh()
 
         if not ledger_df.empty:
             with st.expander("✏️ Edit or delete an entry"):
@@ -743,11 +837,11 @@ with tab_f:
                         db.update_entry(int(eid), d, etype, amt, cat,
                                         int(who) if who else None, mode, desc.strip())
                         st.success("Saved.")
-                        st.rerun()
+                        rerun_fresh()
                     if s2.form_submit_button("Delete"):
                         db.delete_entry(int(eid))
                         st.success("Deleted.")
-                        st.rerun()
+                        rerun_fresh()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -761,14 +855,12 @@ with tab_m:
         flagged_ids = {m["id"] for m in flagged}
         rows = []
         for _, m in members_df.iterrows():
-            mine = recos_df[recos_df["member_id"] == m["id"]] if not recos_df.empty \
-                else recos_df
-            vals = []
-            for _, r in mine.iterrows():
-                c, _s = cmp_for(r, quotes)
-                v = reco_return(r, c)
-                if v is not None:
-                    vals.append(v)
+            # counts co-authored calls too, not just the primary recommender
+            n_calls = 0
+            if not recos_df.empty:
+                for _, _r in recos_df.iterrows():
+                    if m["id"] in authors_of(_r):
+                        n_calls += 1
             paid = ledger_df[(ledger_df["member_id"] == m["id"]) &
                              (ledger_df["entry_type"] == "credit")]["amount"].astype(float).sum() \
                 if not ledger_df.empty else 0.0
@@ -777,8 +869,7 @@ with tab_m:
                 "Role": m["role"] or "Member",
                 "Status": "Active" if m["active"] else "Inactive",
                 "Watchlist": "⚠️" if m["id"] in flagged_ids else "",
-                "Calls": len(mine),
-                "Avg return %": (sum(vals) / len(vals)) if vals else None,
+                "Calls": n_calls,
                 "Attendance": (stats[m["id"]]["rate"] or 0),
                 "Contributed": paid,
             })
@@ -788,14 +879,13 @@ with tab_m:
             (" " + ui.pill("Watchlist", "sell") if r["Watchlist"] else ""),
             ui.pill(r["Role"], "role"),
             str(r["Calls"]),
-            ui.signed(r["Avg return %"]),
             ui.meter(r["Attendance"]),
             f'<span class="lt-strong">{inr(r["Contributed"])}</span>',
         ] for r in rows]
         ui.card("Member master",
                 "The roster every other tab reads from — calls, attendance and money all point here.",
                 ui.table([("Member", False), ("Role", False), ("Calls", True),
-                          ("Avg return", True), ("Attendance", True),
+                          ("Attendance", True),
                           ("Contributed", True)], trs, 820),
                 f'{len(members_df)} member(s) · {inr(credit)} collected in total.')
 
@@ -815,7 +905,7 @@ with tab_m:
                     else:
                         db.add_member(name.strip(), role, joined, True)
                         st.success(f"Added {name.strip()}.")
-                        st.rerun()
+                        rerun_fresh()
 
         if not members_df.empty:
             with st.expander("✏️ Edit or remove a member"):
@@ -849,8 +939,8 @@ with tab_m:
                     if s1.form_submit_button("Save changes", type="primary"):
                         db.update_member(int(pid), name.strip(), role, joined, active)
                         st.success("Saved.")
-                        st.rerun()
+                        rerun_fresh()
                     if s2.form_submit_button("Remove"):
                         db.delete_member(int(pid))
                         st.success("Removed.")
-                        st.rerun()
+                        rerun_fresh()
